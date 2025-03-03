@@ -1,0 +1,154 @@
+pip install numpy scipy scikit-image PyWavelets
+
+import numpy as np
+from osgeo import gdal
+import os
+import pywt
+from skimage import exposure
+from scipy import ndimage
+
+# [Previous support functions remain the same: read_image, write_image, resample_image]
+
+def normalize_image(image):
+    """Normalize image to 0-1 range."""
+    min_val = np.min(image)
+    max_val = np.max(image)
+    if max_val - min_val == 0:
+        return image
+    return (image - min_val) / (max_val - min_val)
+
+def calculate_entropy(image):
+    """Calculate Shannon entropy of the image."""
+    # Ensure image is normalized and converted to uint8 for histogram
+    img_norm = normalize_image(image)
+    img_uint8 = (img_norm * 255).astype(np.uint8)
+    histogram, _ = np.histogram(img_uint8, bins=256, density=True)
+    histogram = histogram[histogram > 0]  # Remove zero probabilities
+    return -np.sum(histogram * np.log2(histogram))
+
+def adaptive_weight(ms_coeff, pan_coeff):
+    """
+    Calculate adaptive weights for coefficient fusion based on local variance.
+    """
+    ms_var = np.var(ms_coeff)
+    pan_var = np.var(pan_coeff)
+
+    if ms_var + pan_var == 0:
+        return 0.5
+
+    w_pan = pan_var / (ms_var + pan_var)
+    return w_pan
+
+def apply_clahe(image):
+    """Apply CLAHE with proper normalization."""
+    img_norm = normalize_image(image)
+    img_enhanced = exposure.equalize_adapthist(img_norm, clip_limit=0.03)
+    return img_enhanced
+
+def wavelet_fusion(ms_band, pan_image, original_shape, wavelet='db4', level=2):
+    """
+    Improved wavelet fusion with entropy preservation.
+    """
+    # Normalize inputs to 0-1
+    ms_norm = normalize_image(ms_band)
+    pan_norm = normalize_image(pan_image)
+
+    # Decompose both images
+    ms_coeffs = pywt.wavedec2(ms_norm, wavelet, level=level)
+    pan_coeffs = pywt.wavedec2(pan_norm, wavelet, level=level)
+
+    # Initialize fused coefficients
+    fused_coeffs = [ms_coeffs[0]]  # Keep MS approximation
+
+    # Process detail coefficients at each level
+    for i in range(1, len(ms_coeffs)):
+        fused_detail = []
+        for j in range(3):  # For each detail sub-band
+            ms_detail = ms_coeffs[i][j]
+            pan_detail = pan_coeffs[i][j]
+
+            # Calculate adaptive weights
+            w_pan = adaptive_weight(ms_detail, pan_detail)
+            w_ms = 1 - w_pan
+
+            # Weighted fusion
+            fused = w_ms * ms_detail + w_pan * pan_detail
+            fused_detail.append(fused)
+
+        fused_coeffs.append(tuple(fused_detail))
+
+    # Reconstruct fused image
+    fused = pywt.waverec2(fused_coeffs, wavelet)
+
+    # Ensure proper size
+    if fused.shape != original_shape:
+        fused = ndimage.zoom(fused,
+                           (original_shape[0]/fused.shape[0],
+                            original_shape[1]/fused.shape[1]),
+                           order=3)
+
+    # Normalize and enhance
+    fused = normalize_image(fused)
+    fused = apply_clahe(fused)
+
+    return fused
+
+def wavelet_fusion_multiband(ms_image, pan_image, wavelet='db4', level=2):
+    """
+    Perform improved wavelet fusion for all bands.
+    """
+    target_shape = (pan_image.shape[0], pan_image.shape[1])
+    fused_image = np.zeros_like(ms_image)
+
+    # Calculate and print original entropy
+    original_entropy = np.mean([calculate_entropy(band) for band in ms_image])
+    print(f"Original MS average entropy: {original_entropy:.2f}")
+
+    # Process each band
+    for i in range(ms_image.shape[0]):
+        fused_band = wavelet_fusion(ms_image[i], pan_image, target_shape, wavelet, level)
+        fused_image[i] = fused_band
+
+    # Calculate and print final entropy
+    final_entropy = np.mean([calculate_entropy(band) for band in fused_image])
+    print(f"Fused image average entropy: {final_entropy:.2f}")
+
+    return fused_image
+
+def main(ms_file, pan_file, output_file):
+    try:
+        # Read images
+        ms_array, ms_dataset = read_image(ms_file)
+        pan_array, pan_dataset = read_image(pan_file)
+        print(f"Read images - MS shape: {ms_array.shape}, PAN shape: {pan_array.shape}")
+
+        # Ensure pan_array is 2D
+        if pan_array.ndim == 3:
+            pan_array = pan_array[0]
+
+        # Normalize input images
+        ms_array = np.clip(ms_array, 0, None)  # Remove negative values
+        pan_array = np.clip(pan_array, 0, None)
+
+        # Resample multispectral image
+        ms_resampled = resample_image(ms_dataset, pan_array.shape[1], pan_array.shape[0])
+        print(f"Resampled MS image shape: {ms_resampled.shape}")
+
+        # Perform improved wavelet fusion
+        fused_image = wavelet_fusion_multiband(ms_resampled, pan_array,
+                                             wavelet='db4', level=2)
+        print("Performed wavelet fusion")
+
+        # Write fused image
+        write_image(output_file, fused_image, pan_dataset)
+        print(f"Successfully wrote fused image to {output_file}")
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    ms_file = "/content/drive/MyDrive/New_fusion/Old_original_data/Kanigiri.tif"
+    pan_file = "/content/drive/MyDrive/New_fusion/Old_original_data/Kanigiri_PAN.tif"
+    output_file = "/content/drive/MyDrive/New_fusion/WAVELET_FUSED_image.tif"
+    main(ms_file, pan_file, output_file)
