@@ -1,0 +1,154 @@
+!pip install PyWavelets
+!pip install gdal
+!pip install scikit-image
+
+import numpy as np
+from osgeo import gdal
+import os
+from skimage import exposure
+import pywt
+from scipy import ndimage
+
+def read_image(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"The file {file_path} does not exist.")
+
+    dataset = gdal.Open(file_path)
+    if dataset is None:
+        raise IOError(f"GDAL failed to open the file {file_path}.")
+
+    bands = [dataset.GetRasterBand(i + 1).ReadAsArray().astype(np.float32)
+            for i in range(dataset.RasterCount)]
+    array = np.stack(bands, axis=0) if len(bands) > 1 else bands[0]
+    return array, dataset
+
+def write_image(file_path, array, dataset):
+    driver = gdal.GetDriverByName("GTiff")
+
+    if not file_path.endswith('.tif'):
+        file_path += '.tif'
+
+    if array.ndim == 2:
+        array = array[np.newaxis, ...]
+
+    array = np.clip(array, 0, 65535)
+
+    out_dataset = driver.Create(file_path, array.shape[2], array.shape[1],
+                              array.shape[0], gdal.GDT_Float32)
+    out_dataset.SetGeoTransform(dataset.GetGeoTransform())
+    out_dataset.SetProjection(dataset.GetProjection())
+
+    for i in range(array.shape[0]):
+        out_band = out_dataset.GetRasterBand(i + 1)
+        out_band.WriteArray(array[i])
+        out_band.FlushCache()
+
+def normalize_image(image):
+    min_val = np.min(image)
+    max_val = np.max(image)
+    if max_val - min_val == 0:
+        return image
+    return (image - min_val) / (max_val - min_val)
+
+def directional_wavelet_fusion(ms_image, pan_image, wavelet='db4', level=4, weight=0.7):
+    """
+    Perform directional wavelet-based image fusion with simplified coefficient handling.
+    """
+    fused_image = np.zeros_like(ms_image)
+    pan_norm = normalize_image(pan_image)
+
+    for i in range(ms_image.shape[0]):
+        # Normalize MS band
+        ms_band_norm = normalize_image(ms_image[i])
+
+        # Decompose images
+        coeffs_ms = pywt.wavedec2(ms_band_norm, wavelet, level=level)
+        coeffs_pan = pywt.wavedec2(pan_norm, wavelet, level=level)
+
+        # Initialize fused coefficients with MS approximation
+        fused_coeffs = [coeffs_ms[0]]  # Keep low frequency from MS
+
+        # Fuse detailed coefficients
+        for j in range(1, len(coeffs_ms)):
+            # Get detailed coefficients
+            ms_details = coeffs_ms[j]
+            pan_details = coeffs_pan[j]
+
+            # Fuse each detail coefficient (horizontal, vertical, diagonal)
+            fused_details = []
+            for ms_coeff, pan_coeff in zip(ms_details, pan_details):
+                # Weighted average of coefficients
+                fused_coeff = (1 - weight) * ms_coeff + weight * pan_coeff
+                fused_details.append(fused_coeff)
+
+            fused_coeffs.append(tuple(fused_details))
+
+        # Reconstruct fused image
+        fused_band = pywt.waverec2(fused_coeffs, wavelet)
+
+        # Handle size mismatch
+        if fused_band.shape != ms_image[i].shape:
+            fused_band = fused_band[:ms_image[i].shape[0], :ms_image[i].shape[1]]
+
+        # Rescale to original range
+        fused_band = normalize_image(fused_band)
+        fused_band = fused_band * (np.max(ms_image[i]) - np.min(ms_image[i])) + np.min(ms_image[i])
+
+        # Apply local contrast enhancement
+        fused_band = exposure.equalize_adapthist(fused_band, clip_limit=0.02)
+        fused_band = fused_band * (np.max(ms_image[i]) - np.min(ms_image[i])) + np.min(ms_image[i])
+
+        fused_image[i] = fused_band
+
+    return fused_image
+
+def resample_image(dataset, width, height):
+    temp_ds = gdal.Warp('', dataset, format='MEM', width=width, height=height,
+                       resampleAlg=gdal.GRA_Cubic)
+    resampled_image = np.zeros((dataset.RasterCount, height, width), dtype=np.float32)
+
+    for i in range(dataset.RasterCount):
+        band_data = temp_ds.GetRasterBand(i + 1).ReadAsArray()
+        resampled_image[i] = normalize_image(band_data)
+
+    return resampled_image
+
+def main(ms_file, pan_file, output_file):
+    try:
+        # Read images
+        ms_array, ms_dataset = read_image(ms_file)
+        pan_array, pan_dataset = read_image(pan_file)
+        print(f"Read images - MS shape: {ms_array.shape}, PAN shape: {pan_array.shape}")
+
+        # Ensure pan_array is 2D
+        if pan_array.ndim == 3:
+            pan_array = pan_array[0]
+
+        # Normalize input images
+        ms_array = np.clip(ms_array, 0, None)
+        pan_array = np.clip(pan_array, 0, None)
+
+        # Resample multispectral image
+        ms_resampled = resample_image(ms_dataset, pan_array.shape[1], pan_array.shape[0])
+        print(f"Resampled MS image shape: {ms_resampled.shape}")
+
+        # Perform fusion
+        fused_image = directional_wavelet_fusion(ms_resampled, pan_array,
+                                               wavelet='db4',
+                                               level=4,
+                                               weight=0.7)
+        print("Performed wavelet fusion")
+
+        # Write fused image
+        write_image(output_file, fused_image, pan_dataset)
+        print(f"Successfully wrote fused image to {output_file}")
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    ms_file = "/content/drive/MyDrive/New_fusion/Old_original_data/Kanigiri.tif"
+    pan_file = "/content/drive/MyDrive/New_fusion/Old_original_data/Kanigiri_PAN.tif"
+    output_file = "/content/drive/MyDrive/New_fusion/Fixed_Directional_Wavelet.tif"
+    main(ms_file, pan_file, output_file)
