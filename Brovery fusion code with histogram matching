@@ -1,0 +1,101 @@
+pip install PyWavelets
+
+import numpy as np
+from osgeo import gdal
+import os
+from skimage import exposure
+
+def read_image(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"The file {file_path} does not exist.")
+
+    dataset = gdal.Open(file_path)
+    if dataset is None:
+        raise IOError(f"GDAL failed to open the file {file_path}. Please check if the file is accessible and in a format supported by GDAL.")
+
+    bands = [dataset.GetRasterBand(i + 1).ReadAsArray() for i in range(dataset.RasterCount)]
+    array = np.stack(bands, axis=0) if len(bands) > 1 else bands[0]
+    return array, dataset
+
+def write_image(file_path, array, dataset):
+    driver = gdal.GetDriverByName("GTiff")
+
+    if not file_path.endswith('.tif'):
+        file_path += '.tif'
+
+    if array.ndim == 2:
+        array = array[np.newaxis, ...]
+
+    out_dataset = driver.Create(file_path, array.shape[2], array.shape[1], array.shape[0], gdal.GDT_Float32)
+    out_dataset.SetGeoTransform(dataset.GetGeoTransform())
+    out_dataset.SetProjection(dataset.GetProjection())
+
+    for i in range(array.shape[0]):
+        out_band = out_dataset.GetRasterBand(i + 1)
+        out_band.WriteArray(array[i])
+        out_band.FlushCache()
+
+def brovey_fusion(ms_image, pan_image):
+    ms_sum = np.sum(ms_image, axis=0)
+
+    # Add a small epsilon to avoid division by zero
+    epsilon = 1e-6
+    ms_sum[ms_sum == 0] = epsilon
+
+    fused_image = np.zeros_like(ms_image, dtype=np.float32)
+
+    for i in range(ms_image.shape[0]):
+        fused_image[i] = (ms_image[i] / ms_sum) * pan_image
+
+    return fused_image
+
+def histogram_match(source, reference):
+    """Match the histogram of the source image to that of the reference image."""
+    matched = exposure.match_histograms(source, reference)
+    return matched
+
+def main(ms_file, pan_file, output_file):
+    try:
+        # Read multispectral image
+        ms_array, ms_dataset = read_image(ms_file)
+        print(f"Successfully read multispectral image. Shape: {ms_array.shape}")
+
+        # Read panchromatic image
+        pan_array, pan_dataset = read_image(pan_file)
+        print(f"Successfully read panchromatic image. Shape: {pan_array.shape}")
+
+        # Ensure pan_array is 2D
+        if pan_array.ndim == 3:
+            pan_array = pan_array[0]
+            print("Converted panchromatic image to 2D.")
+
+        # Upsample multispectral image to match panchromatic resolution
+        ms_upsampled = np.zeros((ms_array.shape[0], pan_array.shape[0], pan_array.shape[1]), dtype=np.float32)
+        for i in range(ms_array.shape[0]):
+            temp_ds = gdal.Warp('', ms_dataset, format='MEM', width=pan_array.shape[1], height=pan_array.shape[0], resampleAlg=gdal.GRA_Bilinear)
+            ms_upsampled[i] = temp_ds.GetRasterBand(i + 1).ReadAsArray()
+        print(f"Upsampled multispectral image. New shape: {ms_upsampled.shape}")
+
+        # Perform Brovey fusion
+        fused_image = brovey_fusion(ms_upsampled, pan_array)
+        print("Performed Brovey fusion.")
+
+        # Apply Histogram Matching for each band to match the panchromatic image's details
+        for i in range(fused_image.shape[0]):
+            fused_image[i] = histogram_match(fused_image[i], pan_array)
+        print("Applied histogram matching to enhance details.")
+
+        # Write fused image with high resolution as a TIFF file
+        write_image(output_file, fused_image, pan_dataset)
+        print(f"Successfully wrote fused image to {output_file}.tif")
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+
+
+if __name__ == "__main__":
+    ms_file = "/content/drive/MyDrive/Kanigiri.tif"
+    pan_file = "/content/drive/MyDrive/Kanigiri_PAN.tif"
+    output_file = "/content/drive/MyDrive/BROVERY_fused_image"
+    main(ms_file, pan_file, output_file)
+
